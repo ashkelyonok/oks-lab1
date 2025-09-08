@@ -163,6 +163,13 @@ class App:
             except Exception as e:
                 status_label.config(text=f"Error: {str(e)}", fg="red")
 
+        def on_enter_key(event):
+            send_message()
+            return "break"
+
+        text_widget.bind("<Return>", on_enter_key)
+        text_widget.bind("<Control-Return>", lambda e: None)
+
         send_button = tk.Button(
             self.current_frame,
             text="Send",

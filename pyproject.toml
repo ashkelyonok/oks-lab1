@@ -1,12 +1,13 @@
 [tool.poetry]
-name = "1lb"
+name = "oks-lab1"
 version = "0.1.0"
 description = ""
-authors = ["Maks1mka <maksim_goncharov_2006@mail.ru>"]
+authors = ["Anastasia <anastasia.shkelyonok@gmail.com>"]
 readme = "README.md"
+packages = [{ include = "src", from = "." }]
 
 [tool.poetry.dependencies]
-python = "^3.13"
+python = "^3.10"
 pyserial = "==3.5"
 
 
