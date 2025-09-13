@@ -1,366 +1,275 @@
 from src.ports_core import PortsCore, PortException
-from tkinter import ttk
+from tkinter import scrolledtext, ttk
 import tkinter as tk
 
 class App:
     def __init__(self):
         self.__ports_core = PortsCore()
+        self.device_number = 1
         self.__root = tk.Tk()
-        self.__root.geometry("300x400")
+        self.__root.geometry("1000x700")
         self.__root.resizable(False, False)
-        self.__root.title("COM-sender")
+        self.__root.title("COM Port Terminal")
         self.__root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        self.current_frame = None
+        self.tx_port = None  # For status
+        self.rx_port = None
+        self.portion_bytes = 0  # For RX portion (reset on pause)
         self.receiving_text_widget = None
         self.receiving_device = None
+        self.ports_open = False
 
-        self.main_frame = tk.Frame(self.__root)
-        self.main_frame.pack(fill="both", expand=True)
+        # Auto-start integrated GUI (no menu)
+        self.render_integrated_gui()
+        # Auto-start RX for demo (modify for device)
+        self.__ports_core.emit_received = self.emit_received_wrapper
+        self.__root.after(100, self.check_portion_end)
 
-    def start(self):
-        self.render_main_menu()
-        self.__root.mainloop()
+    def render_integrated_gui(self):
+        main_container = tk.Frame(self.__root)
+        main_container.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def clear_frame(self):
-        if self.current_frame:
-            self.current_frame.destroy()
-        self.current_frame = tk.Frame(self.main_frame)
-        self.current_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
-    def create_back_button(self):
-        back_button = tk.Button(self.current_frame, text="Back",
-                                command=self.render_main_menu)
-        back_button.pack(anchor="nw", pady=5)
-
-    def render_main_menu(self):
-        self.clear_frame()
-
-        title_label = tk.Label(
-            self.current_frame,
-            text="COM-Sender",
-            font=("Arial", 16, "bold")
-        )
-        title_label.pack(pady=20)
-
-        buttons_info = [
-            ("Choose ports", self.render_select_ports_window),
-            ("Write in port 1_1", lambda: self.render_send_window(1)),
-            ("Write in port 2_2", lambda: self.render_send_window(2)),
-            ("Read from port 1_2", lambda: self.render_receive_window(1)),
-            ("Read from port 2_1", lambda: self.render_receive_window(2)),
-            ("Change ports params", self.render_params_window),
-            ("Ports info", self.render_info_window)
-        ]
-
-        for text, command in buttons_info:
-            button = tk.Button(
-                self.current_frame,
-                text=text,
-                command=command,
-                width=20,
-                height=2
-            )
-            button.pack(pady=1)
-
-    def render_select_ports_window(self, device_number: int = None):
-        self.clear_frame()
-        self.create_back_button()
-
-        title_label = tk.Label(
-            self.current_frame,
-            text="Choose active ports",
-            font=("Arial", 14, "bold")
-        )
-        title_label.pack(pady=10)
-
-        available_ports: list[str] = self.__ports_core.get_available_ports()
-
-        port_vars: dict = {}
-        port_combos: dict = {}
-
-        port_configs = [
-            ("Port 1_1", 1),
-            ("Port 1_2", 2),
-            ("Port 2_1", 3),
-            ("Port 2_2", 4)
-        ]
-
-        for port_name, port_num in port_configs:
-            frame = tk.Frame(self.current_frame)
-            frame.pack(fill="x", pady=5)
-
-            label = tk.Label(frame, text=port_name, width=10)
-            label.pack(side="left")
-
-            var = tk.StringVar()
-            combo = ttk.Combobox(frame, textvariable=var, values=available_ports, state="readonly")
-            combo.pack(side="left", fill="x", expand=True, padx=5)
-
-            port_vars[port_num] = var
-            port_combos[port_num] = combo
-
-        error_label = tk.Label(self.current_frame, text="", fg="red")
-        error_label.pack(pady=5)
-
-        def apply_selection():
-            selected_ports = {}
-            error_messages = []
-
-            for port_num, var in port_vars.items():
-                port_name = var.get()
-                if port_name:
-                    if port_name in selected_ports.values():
-                        error_messages.append(f"Port {port_name} selected multiple times")
-                    selected_ports[port_num] = port_name
-
-            if error_messages:
-                error_label.config(text="\n".join(error_messages))
-                return
-
-            for port_num, port_name in selected_ports.items():
+        # Top: Port selection (restored Combobox original logic)
+        control_frame = tk.LabelFrame(main_container, text="Port Selection & Control", font=('Arial', 12, 'bold'))
+        control_frame.pack(fill='x', pady=5)
+        # Available ports (original)
+        available_ports = self.__ports_core.get_available_ports()
+        # TX Combobox (original style, not spin)
+        tx_frame = tk.Frame(control_frame)
+        tx_frame.pack(side='left', padx=10)
+        tk.Label(tx_frame, text="TX Port (Sender):").pack(side='left')
+        self.tx_var = tk.StringVar()
+        self.tx_combo = ttk.Combobox(tx_frame, textvariable=self.tx_var, values=available_ports, state="readonly", width=15)
+        self.tx_combo.pack(side='left')
+        # Dynamic RX Combobox (read-only, auto from TX)
+        rx_frame = tk.Frame(control_frame)
+        rx_frame.pack(side='left', padx=10)
+        tk.Label(rx_frame, text="RX Port (Receiver, auto):").pack(side='left')
+        self.rx_var = tk.StringVar(value="Select TX for auto RX")
+        self.rx_combo = ttk.Combobox(rx_frame, textvariable=self.rx_var, values=available_ports, state="readonly", width=15)  # Read-only
+        self.rx_combo.pack(side='left')
+        # ### NEW: Hardcode mapping TX to RX (7→10, 8→9)
+        tx_to_rx = {'7': '10', '8': '9'}  # Dict for krest
+        def on_tx_change(*args):
+            tx_selected = self.tx_var.get()
+            if tx_selected and tx_selected.startswith('COM'):
                 try:
-                    port = self.__ports_core.create_port(port_name)
-                    self.__ports_core.set_port(port, port_num)
-                except PortException as e:
-                    error_messages.append(f"Error with {port_name}: {e.message}")
-
-            if error_messages:
-                error_label.config(text="\n".join(error_messages))
+                    tx_num = tx_selected.replace('COM', '')
+                    if tx_num in tx_to_rx:
+                        rx_num = tx_to_rx[tx_num]
+                        rx_selected = f"COM{rx_num}"
+                        if rx_selected in available_ports:
+                            self.rx_var.set(rx_selected)
+                            self.control_error.config(text=f"Auto RX set to {rx_selected}", fg="green")
+                        else:
+                            self.rx_var.set("RX not available")
+                            self.control_error.config(text=f"Warning: RX {rx_selected} not in VSPE", fg="orange")
+                    else:
+                        self.rx_var.set("No auto for this TX")
+                        self.control_error.config(text="Only COM7/COM8 auto-pair", fg="orange")
+                except ValueError:
+                    self.control_error.config(text="Invalid TX", fg="red")
             else:
-                error_label.config(text="Ports configured successfully!", fg="green")
+                self.rx_var.set("Select TX first")
+        self.tx_var.trace('w', on_tx_change)
+        # Baud (custom input: state="normal" for edit)
+        baud_frame = tk.Frame(control_frame)
+        baud_frame.pack(side='left', padx=10)
+        tk.Label(baud_frame, text="Baudrate:").pack(side='left')
+        self.baud_var = tk.StringVar(value=str(self.__ports_core.baudrate))
+        self.baud_combo = ttk.Combobox(baud_frame, textvariable=self.baud_var, values=["9600", "19200", "38400", "57600", "115200"], state="normal", width=10)  # ### FIX4: state="normal" for custom input
+        self.baud_combo.pack(side='left')
+        # Timeout
+        timeout_frame = tk.Frame(control_frame)
+        timeout_frame.pack(side='left', padx=10)
+        tk.Label(timeout_frame, text="Timeout (s):").pack(side='left')
+        self.timeout_var = tk.StringVar(value=str(self.__ports_core.timeout))
+        self.timeout_combo = ttk.Combobox(timeout_frame, textvariable=self.timeout_var, values=["0.1", "0.2", "0.3", "0.4", "0.5", "1.0"], state="normal", width=10)  # Allow custom
+        self.timeout_combo.pack(side='left')
+        # Toggle button (Open/Close)
+        self.open_btn = tk.Button(control_frame, text="Open Ports", command=self.toggle_ports)
+        self.open_btn.pack(side='right', padx=10)
+        self.control_error = tk.Label(control_frame, text="Select TX for auto RX", fg="blue")
+        self.control_error.pack(side='right', padx=5)
 
-        apply_button = tk.Button(self.current_frame, text="Select", command=apply_selection)
-        apply_button.pack(pady=10)
+        # Status (right, as before)
+        status_frame = tk.LabelFrame(main_container, text="Status", font=('Arial', 12, 'bold'), width=200)
+        status_frame.pack(side='right', fill='y', padx=10, pady=5)
+        status_frame.pack_propagate(False)
+        self.status_label = tk.Label(status_frame, text="TX Port: N/A\nRX Port: N/A", fg="blue", justify='left')
+        self.status_label.pack(pady=10)
 
-    def render_send_window(self, device_number: int):
-        self.clear_frame()
-        self.create_back_button()
-
-        title_text = f"Write to port {1 if device_number == 1 else 2}_{1 if device_number == 1 else 2}"
-        title_label = tk.Label(
-            self.current_frame,
-            text=title_text,
-            font=("Arial", 14, "bold")
-        )
-        title_label.pack(pady=10)
-
-        text_widget = tk.Text(self.current_frame, height=10, width=60)
-        text_widget.pack(pady=10, fill="both", expand=True)
-
-        status_label = tk.Label(self.current_frame, text="", fg="green")
-        status_label.pack(pady=5)
+        # Input (TX)
+        input_frame = tk.LabelFrame(main_container, text="Input (TX)", font=('Arial', 12, 'bold'))
+        input_frame.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+        self.input_text = tk.Text(input_frame, height=10, width=40)
+        self.input_text.pack(pady=10, fill="both", expand=True)
+        self.input_status = tk.Label(input_frame, text="", fg="green")
+        self.input_status.pack(pady=5)
 
         def send_message():
-            message = text_widget.get("1.0", tk.END).strip()
-            if not message:
-                status_label.config(text="Message is empty!", fg="red")
+            if not self.ports_open:
+                self.input_status.config(text="Open ports first!", fg="red")
                 return
-
+            message = self.input_text.get("1.0", tk.END).strip()
+            if not message:
+                self.input_status.config(text="Message is empty!", fg="red")
+                return
             try:
-                sent_count = self.__ports_core.send_message(device_number, message.encode())
-                status_label.config(text=f"Sent {sent_count} characters successfully!", fg="green")
+                msg_bytes = message.encode('ascii', errors='ignore')
+                sent_count = self.__ports_core.send_message(self.device_number, msg_bytes)
+                self.input_status.config(text="")  # Очищаем перед обновлением
+                self.input_status.config(text=f"Sent {sent_count} bytes (portion)!", fg="green")
+                self.input_text.delete("1.0", tk.END)
+                self.input_text.focus()
+                self.output_text.insert(tk.END, "\n")
+                self.output_text.insert(tk.END, message)
+                self.debug_text.insert(tk.END, f"Sent {sent_count} bytes: {message}\n")
+                self.debug_text.see(tk.END)
             except Exception as e:
-                status_label.config(text=f"Error: {str(e)}", fg="red")
+                self.input_status.config(text=f"Error: {str(e)}", fg="red")
+                self.debug_text.insert(tk.END, f"Send error: {e}\n")
 
         def on_enter_key(event):
             send_message()
             return "break"
 
-        text_widget.bind("<Return>", on_enter_key)
-        text_widget.bind("<Control-Return>", lambda e: None)
+        self.input_text.bind("<Return>", on_enter_key)
+        self.input_text.bind("<Control-Return>", lambda e: None)
+        send_btn = tk.Button(input_frame, text="Send", command=send_message)
+        send_btn.pack(pady=5)
 
-        send_button = tk.Button(
-            self.current_frame,
-            text="Send",
-            command=send_message, width=20
-        )
-        send_button.pack(pady=10)
+        # Output (RX, initial "Not receiving")
+        output_frame = tk.LabelFrame(main_container, text="Output (RX)", font=('Arial', 12, 'bold'))
+        output_frame.pack(side='right', fill='both', expand=True, padx=5, pady=5)
+        self.output_text = scrolledtext.ScrolledText(output_frame, height=10, width=40)
+        self.output_text.pack(pady=10, fill="both", expand=True)
+        self.output_status = tk.Label(output_frame, text="Not receiving", fg="gray")  ### FIX3: Initial not receiving
+        self.output_status.pack(pady=5)
 
-    def render_receive_window(self, device_number: int):
-        self.clear_frame()
-        self.create_back_button()
+        # Debug
+        debug_frame = tk.LabelFrame(self.__root, text="Debug Log", font=('Arial', 12, 'bold'))
+        debug_frame.pack(fill='x', padx=10, pady=5)
+        self.debug_text = scrolledtext.ScrolledText(debug_frame, height=5, width=100, state='normal')
+        self.debug_text.pack(pady=5, fill='x')
+        self.debug_text.insert(tk.END, "Debug started. Select TX for auto RX, then Open Ports.\n")
 
-        title_text = f"Read from port {1 if device_number == 1 else 2}_{2 if device_number == 1 else 1}"
-        title_label = tk.Label(
-            self.current_frame,
-            text=title_text,
-            font=("Arial", 14, "bold")
-        )
-        title_label.pack(pady=10)
+        self.update_status()
 
-        text_widget = tk.Text(self.current_frame, height=10, width=60)
-        text_widget.pack(pady=10, fill="both", expand=True)
-        self.receiving_text_widget = text_widget
-        self.receiving_device = device_number
-
-        status_label = tk.Label(self.current_frame, text="Not receiving", fg="gray")
-        status_label.pack(pady=5)
-
-        def emit_received_wrapper(message: bytes, bytes_count: int):
-            def update_text():
-                text_widget.delete("1.0", tk.END)
-                text_widget.insert("1.0", message.decode(errors='ignore'))
-                status_label.config(text=f"Received {bytes_count} bytes", fg="green")
-
-            self.__root.after(500, update_text)
-
-        self.__ports_core.emit_received = emit_received_wrapper
-
-        def start_receiving():
+    def toggle_ports(self):
+        """Toggle open/close (### FIX3: Open starts RX)"""
+        if not self.ports_open:
+            # Open
+            tx_selected = self.tx_var.get()
+            rx_selected = self.rx_var.get()
+            if not tx_selected or rx_selected == "Select TX first" or not rx_selected.startswith('COM'):
+                self.control_error.config(text="Select valid TX/RX pair!", fg="red")
+                return
             try:
-                self.__ports_core.start_receiving(device_number)
-                status_label.config(text="Receiving...", fg="blue")
-                start_button.config(state="disabled")
-                stop_button.config(state="normal")
-            except Exception as e:
-                status_label.config(text=f"Error: {str(e)}", fg="red")
-
-        def stop_receiving():
+                baud = int(self.baud_var.get())
+                timeout = float(self.timeout_var.get())
+                # Create/set TX (slot 1)
+                tx_port = self.__ports_core.create_port(tx_selected)
+                self.__ports_core.set_port(tx_port, 1)
+                # Create/set RX (slot 2)
+                rx_port = self.__ports_core.create_port(rx_selected)
+                self.__ports_core.set_port(rx_port, 2)
+                # Set params
+                self.__ports_core.set_ports_params(baudrate=baud, timeout=timeout)
+                self.tx_port = tx_selected
+                self.rx_port = rx_selected
+                self.ports_open = True
+                self.open_btn.config(text="Close Ports")
+                self.control_error.config(text=f"Ports opened: TX {tx_selected}, RX {rx_selected}", fg="green")
+                self.debug_text.insert(tk.END, f"Ports opened TX {tx_selected} RX {rx_selected} baud {baud} timeout {timeout}\n")
+                self.update_status()
+                # ### FIX3/FIX4: Start RX after open
+                self.start_receiving(self.device_number)
+                self.output_status.config(text="Receiving...", fg="blue")
+            except PortException as e:
+                self.control_error.config(text=f"Error: {e.message}", fg="red")
+                self.debug_text.insert(tk.END, f"Open error: {e.message}\n")
+        else:
+            # Close
             try:
                 self.__ports_core.end_receiving()
-                status_label.config(text="Stopped receiving", fg="gray")
-                start_button.config(state="normal")
-                stop_button.config(state="disabled")
+                self.__ports_core.close_active_ports()
+                self.ports_open = False
+                self.open_btn.config(text="Open Ports")
+                self.tx_port = None
+                self.rx_port = None
+                self.portion_bytes = 0
+                self.output_text.delete("1.0", tk.END)
+                self.output_status.config(text="Not receiving", fg="gray")  # Информируем о закрытии
+                self.input_status.config(text="Ports closed - ready to open")  # Информируем о состоянии отправки
+                self.current_portion = b""  # Сбрасываем буфер
+                self.control_error.config(text="Ports closed - no sending/receiving", fg="orange")
+                self.debug_text.insert(tk.END, "Ports closed, RX stopped.\n")
+                self.update_status()  # Обновляем статусное окно
             except Exception as e:
-                status_label.config(text=f"Error: {str(e)}", fg="red")
+                self.control_error.config(text=f"Close error: {str(e)}", fg="red")
 
-        button_frame = tk.Frame(self.current_frame)
-        button_frame.pack(pady=10)
+    def update_status(self):
+        tx_str = self.tx_port if self.tx_port else "N/A"
+        rx_str = self.rx_port if self.rx_port else "N/A"
+        self.status_label.config(text=f"TX Port: {tx_str}\nRX Port: {rx_str}")
 
-        start_button = tk.Button(
-            button_frame,
-            text="Start Receiving",
-            command=start_receiving
-        )
-        start_button.pack(side="left", padx=5)
+    def start_receiving(self, device_number):
+        try:
+            self.__ports_core.start_receiving(device_number)
+            self.output_status.config(text="Receiving...", fg="blue")
+            self.debug_text.insert(tk.END, f"RX started for device {device_number}\n")
+        except Exception as e:
+            self.output_status.config(text=f"Error: {str(e)}", fg="red")
+            self.debug_text.insert(tk.END, f"RX start error: {e}\n")
 
-        stop_button = tk.Button(
-            button_frame,
-            text="Stop Receiving",
-            command=stop_receiving,
-            state="disabled"
-        )
-        stop_button.pack(side="left", padx=5)
+    def check_portion_end(self):
+        if hasattr(self, 'current_portion') and self.current_portion and self.ports_open:
+            # Если данные накопились, но новых не поступает (условно после паузы)
+            self.output_text.insert(tk.END, "\n")  # Новая строка
+            self.output_text.insert(tk.END, self.current_portion.decode(errors='ignore'))
+            self.output_status.config(text=f"Received {self.portion_bytes} bytes in portion", fg="green")
+            self.update_status()
+            self.current_portion = b""
+            self.portion_bytes = 0
+            self.__root.after(2000, lambda: self.output_status.config(text="Receiving...", fg="blue") if self.ports_open else None)
+            
+        if self.ports_open:
+            self.__root.after(100, self.check_portion_end)
 
-    def render_info_window(self):
-        """Окно информации о портах"""
-        self.clear_frame()
-        self.create_back_button()
+    def emit_received_wrapper(self, message: bytes, bytes_count: int):
+        """### FIX4: Debug emit, incremental for sync"""
+        def update_output():
+            if not hasattr(self, 'current_portion'):
+                self.current_portion = b""  # Инициализируем буфер, если его нет
+            self.debug_text.insert(tk.END, f"Emit called with {len(message)} bytes (portion {bytes_count})\n")
 
-        title_label = tk.Label(
-            self.current_frame,
-            text="Ports Information",
-            font=("Arial", 14, "bold")
-        )
-        title_label.pack(pady=10)
+            if bytes_count > 0:  # Накопление байтов
+                self.current_portion += message  # Добавляем текущий байт
+                self.portion_bytes += bytes_count  # Увеличиваем счетчик для текущей порции
+            else:  # Предполагаем конец порции (например, после паузы, но без явного сигнала)
+                if self.current_portion:  # Если есть накопленные данные
+                    self.output_text.insert(tk.END, "\n")  # Новая строка перед порцией
+                    self.output_text.insert(tk.END, self.current_portion.decode(errors='ignore'))  # Отображаем всю порцию
+                    self.output_status.config(text=f"Received {self.portion_bytes} bytes in portion", fg="green")
+                    self.update_status()
+                    self.current_portion = b""  # Сбрасываем буфер
+                    self.portion_bytes = 0  # Сбрасываем счетчик
+                    self.__root.after(2000, lambda: self.output_status.config(text="Receiving...", fg="blue") if self.ports_open else None)
+                
 
-        # Текстовое поле для информации
-        info_text = tk.Text(self.current_frame, height=15, width=60)
-        info_text.pack(pady=10, fill="both", expand=True)
+            self.output_text.see(tk.END)
+            self.debug_text.see(tk.END)
 
-        def update_info():
-            """Обновляет информацию о портах"""
-            try:
-                info = self.__ports_core.print_ports_info()
-                info_text.delete("1.0", tk.END)
-                info_text.insert("1.0", info)
-            except Exception as e:
-                info_text.delete("1.0", tk.END)
-                info_text.insert("1.0", f"Error getting port info: {str(e)}")
-
-        update_info()
-
-        refresh_button = tk.Button(
-            self.current_frame,
-            text="Refresh",
-            command=update_info
-        )
-        refresh_button.pack(pady=5)
-
-    def render_params_window(self):
-        """Окно изменения параметров портов"""
-        self.clear_frame()
-        self.create_back_button()
-
-        title_label = tk.Label(
-            self.current_frame,
-            text="Change Port Parameters",
-            font=("Arial", 14, "bold")
-        )
-        title_label.pack(pady=10)
-
-        # Baudrate selection
-        baud_frame = tk.Frame(self.current_frame)
-        baud_frame.pack(fill="x", pady=5)
-
-        baud_label = tk.Label(baud_frame, text="Choose baudrate:", width=15)
-        baud_label.pack(side="left")
-
-        baud_var = tk.StringVar(value=str(self.__ports_core.baudrate))
-        baud_combo = ttk.Combobox(
-            baud_frame,
-            textvariable=baud_var,
-            values=["1000", "2000", "3000", "4000", "5000"],
-            state="readonly", width=10)
-        baud_combo.pack(side="left", padx=5)
-
-        def apply_baudrate():
-            """Применяет выбранный baudrate"""
-            try:
-                baudrate = int(baud_var.get())
-                self.__ports_core.set_ports_params(baudrate=baudrate)
-                baud_status.config(text="Baudrate applied successfully!", fg="green")
-            except Exception as e:
-                baud_status.config(text=f"Error: {str(e)}", fg="red")
-
-        baud_button = tk.Button(baud_frame, text="Apply", command=apply_baudrate)
-        baud_button.pack(side="left", padx=5)
-
-        baud_status = tk.Label(self.current_frame, text="", fg="green")
-        baud_status.pack(pady=2)
-
-        # Timeout selection
-        timeout_frame = tk.Frame(self.current_frame)
-        timeout_frame.pack(fill="x", pady=5)
-
-        timeout_label = tk.Label(timeout_frame, text="Choose timeout:", width=15)
-        timeout_label.pack(side="left")
-
-        timeout_var = tk.StringVar(value=str(self.__ports_core.timeout))
-        timeout_combo = ttk.Combobox(
-            timeout_frame, textvariable=timeout_var,
-            values=["0.1", "0.2", "0.3", "0.4", "0.5"],
-            state="readonly",
-            width=10
-        )
-        timeout_combo.pack(side="left", padx=5)
-
-        def apply_timeout():
-            """Применяет выбранный timeout"""
-            try:
-                timeout = float(timeout_var.get())
-                self.__ports_core.set_ports_params(timeout=timeout)
-                timeout_status.config(text="Timeout applied successfully!", fg="green")
-            except Exception as e:
-                timeout_status.config(text=f"Error: {str(e)}", fg="red")
-
-        timeout_button = tk.Button(timeout_frame, text="Apply", command=apply_timeout)
-        timeout_button.pack(side="left", padx=5)
-
-        timeout_status = tk.Label(self.current_frame, text="", fg="green")
-        timeout_status.pack(pady=2)
+        self.__root.after(10, update_output)
 
     def on_closing(self):
-        """Обработчик закрытия приложения"""
         try:
-            # Останавливаем прием, если он активен
-            if hasattr(self.__ports_core, 'is_receiving') and self.__ports_core.is_receiving:
-                self.__ports_core.end_receiving()
-
-            # Закрываем все порты
-            self.__ports_core.close_active_ports()
-        except:
+            if self.ports_open:
+                self.toggle_ports()  # Close on exit
+            self.__root.destroy()
+        except Exception as e:
             pass
 
-        self.__root.destroy()
+    def start(self):
+        self.__root.mainloop()

@@ -18,17 +18,17 @@ class PortsCore:
 
         # Ports parameters
         self.baudrate: int = 1000
-        self.timeout: int = 1
+        self.timeout: float = 1.0
 
         # Attrs for receiving ports
         self.receiving_thread: threading.Thread | None = None
         self.is_receiving: bool = False
 
         # Other params
-        self.MESSAGE_END_CHAR = b"\0"
+        self.MESSAGE_END_CHAR = b"\0" ### Comment out or remove for raw (we remove in send)
 
     def send_message(self, chosen_device: int, message: bytes) -> int:
-        sent_chars_count: int = 0
+        sent_chars_count: int = 0 # Unused — bug?
         chosen_port: serial.Serial | None = None
 
         if chosen_device == 1 and self.port1_1 and self.port1_1.is_open:
@@ -36,15 +36,15 @@ class PortsCore:
         elif chosen_device == 2 and self.port2_2 and self.port2_2.is_open:
             chosen_port = self.port2_2
         else:
-            raise "Invalid device number or port is not open"
+            raise PortException("Invalid device number or port is not open")
 
-        chosen_port.write(message + self.MESSAGE_END_CHAR)
+        chosen_port.write(message) ### FIX: Remove + self.MESSAGE_END_CHAR for raw stream (req #4)
 
         return len(message)
 
 
     def start_receiving(self, chosen_device: int) -> None: # , listener: callable
-        def receive_tread_body(port: serial.Serial) -> None:
+        def receive_thread_body(port: serial.Serial) -> None:
             message: bytes = b""
             received_chars_count: int = 0
             count_of_empty_chars: int = 0
@@ -52,15 +52,16 @@ class PortsCore:
             while self.is_receiving and port and port.is_open:
                 try:
                     byte = port.read(1)
-                    # if count_of_empty_chars > 5:
-                    #     break
-                    # elif byte == b"":
-                    #     count_of_empty_chars += 1
-                    # el
                     if self.is_receiving and byte != b'':
-                        message += byte
-                        received_chars_count += 1
-                        self.emit_received(message, received_chars_count)
+                        received_chars_count += 1  ### NEW: Increment portion
+                        self.emit_received(byte, 1)  ### FIX: Emit single byte, not cumulative message (for real-time, portion per byte)
+                        count_of_empty_chars = 0  ### NEW: Reset empty on data
+                    else:  ### FIX: Handle empty for portion end (uncommented logic)
+                        count_of_empty_chars += 1
+                        if count_of_empty_chars > 5:  ### NEW: Pause >5 empty = end portion, reset count (for req #6 bytes in portion)
+                            received_chars_count = 0  ### NEW: Reset portion count (App will use this via emit or add self.portion_bytes)
+                            count_of_empty_chars = 0
+                            # Optional: emit b'' for end signal, but skip for raw
                 except Exception as e:
                     raise PortException(f"Reading exception")
 
@@ -70,9 +71,9 @@ class PortsCore:
         elif chosen_device == 2:
             chosen_port = self.port2_1
         else:
-            raise "Invalid device number"
+            raise PortException("Invalid device number")  ### FIX: Use PortException
 
-        self.receiving_thread = threading.Thread(target=receive_tread_body, args=(chosen_port,))
+        self.receiving_thread = threading.Thread(target=receive_thread_body, args=(chosen_port,))
         self.is_receiving = True
         self.receiving_thread.start()
 
@@ -91,6 +92,9 @@ class PortsCore:
                 port_name,
                 baudrate=self.baudrate,
                 timeout=self.timeout,
+                bytesize=8,  ### NEW: Fixed for lab req (8 data bits)
+                parity='N',  ### NEW: No parity
+                stopbits=1   ### NEW: 1 stop bit
             )
         except SerialException:
             raise PortException("Port is not found or it is unavailable")
@@ -117,12 +121,12 @@ class PortsCore:
 
     def get_available_ports(self) -> list[str]:
         ports = [port.name for port in comports()]
-        print(ports)
+        # print(ports)
         return ports
 
     def set_ports_params(self, baudrate: int | None = None, timeout: float | None = None):
         if baudrate:
-            self.baud_rate = baudrate
+            self.baudrate = baudrate
 
             if self.port1_1 and self.port1_1.is_open: self.port1_1.baudrate = baudrate
             if self.port1_2 and self.port1_2.is_open: self.port1_2.baudrate = baudrate
@@ -147,7 +151,7 @@ class PortsCore:
         """
 
     def close_active_ports(self) -> None:
-        self.port1_1.close()
-        self.port1_2.close()
-        self.port2_1.close()
-        self.port2_2.close()
+        if self.port1_1: self.port1_1.close()
+        if self.port1_2: self.port1_2.close()
+        if self.port2_1: self.port2_1.close()
+        if self.port2_2: self.port2_2.close()
